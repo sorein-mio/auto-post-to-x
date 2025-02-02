@@ -24,25 +24,43 @@ function wp_to_x_activate() {
     add_option('wp_to_x_enable_update_post', '1');  // デフォルトで有効
     add_option('wp_to_x_update_interval', '3600');  // デフォルトで1時間
     add_option('wp_to_x_update_template', '記事を更新しました：{title} {url}');
+    
+    // ハッシュタグ関連の設定を追加
+    add_option('wp_to_x_default_hashtags', '');  // デフォルトハッシュタグ
+    add_option('wp_to_x_use_category_hashtags', '1');  // カテゴリーをハッシュタグとして使用
+    add_option('wp_to_x_max_hashtags', '3');  // 最大ハッシュタグ数
 }
 
-// 投稿が公開された時のフック
-add_action('publish_post', 'post_to_x', 10, 2);
-add_action('post_updated', 'handle_post_update', 10, 3);
+// フックの登録を修正
+add_action('transition_post_status', 'handle_post_status_transition', 10, 3);
 
-function post_to_x($post_id, $post) {
+// 新しい関数を修正
+function handle_post_status_transition($new_status, $old_status, $post) {
+    // 投稿タイプが'post'でない場合は処理しない
+    if ($post->post_type !== 'post') {
+        return;
+    }
+
+    // 同じ投稿の処理中フラグをチェック
+    $post_processing = get_transient('wp_to_x_processing_post_' . $post->ID);
+    if ($post_processing) {
+        error_log('WP to X Auto Post: この投稿は処理中です - Post ID: ' . $post->ID);
+        return;
+    }
+
+    // グローバルな処理中フラグをチェック
+    $global_processing = get_transient('wp_to_x_global_processing');
+    if ($global_processing) {
+        error_log('WP to X Auto Post: 他の投稿を処理中のため、スキップします');
+        return;
+    }
+
     try {
-        // 新規投稿かどうかをチェック
-        if (get_post_meta($post_id, 'posted_to_x', true)) {
-            error_log('WP to X Auto Post: 既に投稿済みの記事です。 Post ID: ' . $post_id);
-            return;
-        }
-        
-        // 投稿が新規作成されてから一定時間（例：1時間）以上経過している場合は投稿しない
-        $post_date = strtotime($post->post_date);
-        if (time() - $post_date > 3600) { // 3600秒 = 1時間
-            return;
-        }
+        // 処理中フラグを設定（1分間）
+        set_transient('wp_to_x_processing_post_' . $post->ID, true, 60);
+        set_transient('wp_to_x_global_processing', true, 60);
+
+        error_log('WP to X Auto Post: ステータス遷移 - Post ID: ' . $post->ID . ', Old: ' . $old_status . ', New: ' . $new_status);
 
         // APIキーを取得
         $api_key = get_option('wp_to_x_api_key');
@@ -50,77 +68,86 @@ function post_to_x($post_id, $post) {
         $access_token = get_option('wp_to_x_access_token');
         $access_token_secret = get_option('wp_to_x_access_token_secret');
 
-        // 投稿内容を作成
-        $post_title = $post->post_title;
-        $post_url = get_permalink($post_id);
-        $tweet_text = $post_title . ' ' . $post_url;
+        if ($old_status !== 'publish' && $new_status === 'publish') {
+            // 新規公開の場合
+            if (get_post_meta($post->ID, 'posted_to_x', true)) {
+                error_log('WP to X Auto Post: 既に投稿済みの記事です。 Post ID: ' . $post->ID);
+                return;
+            }
 
-        error_log('WP to X Auto Post: 投稿を試みます - ' . $tweet_text);
+            // 投稿内容を作成
+            $post_title = $post->post_title;
+            $post_url = get_permalink($post->ID);
+            $hashtags = wp_to_x_generate_hashtags($post->ID);
+            
+            $tweet_text = $post_title . ' ' . $post_url;
+            if (!empty($hashtags)) {
+                $tweet_text .= ' ' . $hashtags;
+            }
 
-        // Xに投稿
-        $result = post_to_x_api($tweet_text, $api_key, $api_secret, $access_token, $access_token_secret);
+            // Xに投稿
+            $result = post_to_x_api($tweet_text, $api_key, $api_secret, $access_token, $access_token_secret);
+            
+            if ($result === true) {
+                add_post_meta($post->ID, 'posted_to_x', true);
+                error_log('WP to X Auto Post: 投稿成功 - Post ID: ' . $post->ID);
+            } elseif ($result === "RATE_LIMIT") {
+                update_option('wp_to_x_rate_limit_notice', 'レート制限に達しました。無料プランの上限は1ヶ月あたり1,500ツイート(17 requests / 24 hours)です。詳細は https://developer.x.com/en/portal/products をご確認ください。');
+                return;
+            } else {
+                error_log('WP to X Auto Post: 投稿失敗');
+            }
 
-        if ($result) {
-            // 投稿完了をマーク
-            add_post_meta($post_id, 'posted_to_x', true);
-            error_log('WP to X Auto Post: 投稿成功 - Post ID: ' . $post_id);
-        } else {
-            error_log('WP to X Auto Post: 投稿失敗 - Post ID: ' . $post_id);
+        } elseif ($old_status === 'publish' && $new_status === 'publish') {
+            // 更新の場合
+            // 新規投稿から1分以内の場合は更新投稿をスキップ
+            $post_date = strtotime($post->post_date);
+            if (time() - $post_date < 60) {
+                return;
+            }
+
+            // 更新時の投稿が無効な場合はスキップ
+            if (get_option('wp_to_x_enable_update_post') !== '1') {
+                return;
+            }
+
+            // 最後の更新からの経過時間をチェック
+            $last_update = get_post_meta($post->ID, 'last_x_update', true);
+            $update_interval = get_option('wp_to_x_update_interval', 3600);
+            if ($last_update && (time() - intval($last_update) < intval($update_interval))) {
+                return;
+            }
+
+            // テンプレートを使用してメッセージを作成
+            $post_title = $post->post_title;
+            $post_url = get_permalink($post->ID);
+            $template = get_option('wp_to_x_update_template', '記事を更新しました：{title} {url}');
+            $tweet_text = str_replace(
+                ['{title}', '{url}'],
+                [$post_title, $post_url],
+                $template
+            );
+
+            // ハッシュタグを追加
+            $hashtags = wp_to_x_generate_hashtags($post->ID);
+            if (!empty($hashtags)) {
+                $tweet_text .= ' ' . $hashtags;
+            }
+
+            // Xに投稿
+            $result = post_to_x_api($tweet_text, $api_key, $api_secret, $access_token, $access_token_secret);
+            
+            if ($result) {
+                update_post_meta($post->ID, 'last_x_update', time());
+            }
         }
 
     } catch (Exception $e) {
-        error_log('WP to X Auto Post: Exception in post_to_x - ' . $e->getMessage());
-    }
-}
-
-function handle_post_update($post_id, $post_after, $post_before) {
-    // 投稿タイプが'post'でない場合は処理しない
-    if ($post_after->post_type !== 'post') {
-        return;
-    }
-
-    // 下書きから公開への変更を検知
-    if ($post_before->post_status !== 'publish' && $post_after->post_status === 'publish') {
-        // 新規公開として処理
-        post_to_x($post_id, $post_after);
-        return;
-    }
-
-    // 更新の場合（既に公開済みの記事の更新）
-    if ($post_before->post_status === 'publish' && $post_after->post_status === 'publish') {
-        // 更新時の投稿が無効な場合はスキップ
-        if (get_option('wp_to_x_enable_update_post') !== '1') {
-            return;
-        }
-
-        // 最後の更新からの経過時間をチェック
-        $last_update = get_post_meta($post_id, 'last_x_update', true);
-        $update_interval = get_option('wp_to_x_update_interval', 3600);
-        if ($last_update && (time() - intval($last_update) < intval($update_interval))) {
-            return;
-        }
-
-        // X APIの認証情報を取得
-        $api_key = get_option('wp_to_x_api_key');
-        $api_secret = get_option('wp_to_x_api_secret');
-        $access_token = get_option('wp_to_x_access_token');
-        $access_token_secret = get_option('wp_to_x_access_token_secret');
-
-        // テンプレートを使用してメッセージを作成
-        $post_title = $post_after->post_title;
-        $post_url = get_permalink($post_id);
-        $template = get_option('wp_to_x_update_template', '記事を更新しました：{title} {url}');
-        $tweet_text = str_replace(
-            ['{title}', '{url}'],
-            [$post_title, $post_url],
-            $template
-        );
-
-        // Xに投稿
-        post_to_x_api($tweet_text, $api_key, $api_secret, $access_token, $access_token_secret);
-
-        // 最終更新時刻を記録
-        update_post_meta($post_id, 'last_x_update', time());
+        error_log('WP to X Auto Post: Exception in handle_post_status_transition - ' . $e->getMessage());
+    } finally {
+        // 必ずフラグを削除
+        delete_transient('wp_to_x_processing_post_' . $post->ID);
+        delete_transient('wp_to_x_global_processing');
     }
 }
 
@@ -129,85 +156,54 @@ function post_to_x_api($tweet_text, $api_key, $api_secret, $access_token, $acces
     require_once(plugin_dir_path(__FILE__) . 'includes/TwitterAPIExchange.php');
     
     try {
-        error_log('WP to X Auto Post: API呼び出し開始');
-        error_log('WP to X Auto Post: 投稿内容 - ' . $tweet_text);
-        
-        // APIキーの長さと形式をチェック
-        error_log('WP to X Auto Post: API Key長: ' . strlen($api_key));
-        error_log('WP to X Auto Post: API Secret長: ' . strlen($api_secret));
-        error_log('WP to X Auto Post: Access Token長: ' . strlen($access_token));
-        error_log('WP to X Auto Post: Access Token Secret長: ' . strlen($access_token_secret));
-        
-        // APIキーが設定されているかチェック
-        if (empty($api_key) || empty($api_secret) || empty($access_token) || empty($access_token_secret)) {
-            error_log('WP to X Auto Post: API認証情報が設定されていません。');
-            error_log('API Key: ' . ($api_key ? '設定済み' : '未設定'));
-            error_log('API Secret: ' . ($api_secret ? '設定済み' : '未設定'));
-            error_log('Access Token: ' . ($access_token ? '設定済み' : '未設定'));
-            error_log('Access Token Secret: ' . ($access_token_secret ? '設定済み' : '未設定'));
-            return false;
-        }
+        // APIリクエストの間隔を確保（1秒待機）
+        sleep(1);
 
-        // APIキーの形式チェック（基本的な文字種のチェック）
-        if (!preg_match('/^[A-Za-z0-9\-_]+$/', $api_key) || 
-            !preg_match('/^[A-Za-z0-9\-_]+$/', $api_secret) || 
-            !preg_match('/^[0-9]+-[A-Za-z0-9\-_]+$/', $access_token) || 
-            !preg_match('/^[A-Za-z0-9\-_]+$/', $access_token_secret)) {
-            error_log('WP to X Auto Post: API認証情報の形式が不正です');
-            return false;
-        }
-
+        // 設定を準備
         $settings = array(
-            'oauth_access_token' => trim($access_token),
-            'oauth_access_token_secret' => trim($access_token_secret),
-            'consumer_key' => trim($api_key),
-            'consumer_secret' => trim($api_secret)
+            'oauth_access_token' => $access_token,
+            'oauth_access_token_secret' => $access_token_secret,
+            'consumer_key' => $api_key,
+            'consumer_secret' => $api_secret
         );
 
-        error_log('WP to X Auto Post: 認証設定完了');
-        error_log('WP to X Auto Post: 認証設定内容（一部マスク） - ' . 
-                 'API Key: ' . substr($api_key, 0, 4) . '..., ' .
-                 'Access Token: ' . substr($access_token, 0, 8) . '...');
-
-        // v1.1 APIエンドポイントを使用
-        $url = 'https://api.twitter.com/1.1/statuses/update.json';
-        $requestMethod = 'POST';
+        $url = 'https://api.twitter.com/2/tweets';
         
-        // POSTデータを配列として準備（v1.1 API用）
+        // リクエストデータを配列で準備
         $postfields = array(
-            'status' => $tweet_text // エンコードはTwitterAPIExchangeクラスに任せる
+            'text' => $tweet_text
         );
-
-        error_log('WP to X Auto Post: リクエスト準備 - URL: ' . $url);
-        error_log('WP to X Auto Post: POST データ - ' . json_encode($postfields));
-
+        
+        // APIリクエストを実行
         $twitter = new TwitterAPIExchange($settings);
-        
-        // OAuth署名を含むリクエストを構築
-        $response = $twitter->buildOauth($url, $requestMethod)
-                           ->setPostfields($postfields)
-                           ->performRequest();
-
-        error_log('WP to X Auto Post: API レスポンス受信');
-        error_log('WP to X Auto Post: レスポンス内容 - ' . $response);
-
-        // レスポンスをデコード
-        $result = json_decode($response, true);
-        
-        // エラーチェック（v1.1 APIのレスポンス形式に合わせて修正）
-        if (isset($result['errors']) || !isset($result['id_str'])) {
-            error_log('WP to X Auto Post: API エラー検出');
-            error_log('WP to X Auto Post: エラー詳細 - ' . print_r($result, true));
-            return false;
+        if (!defined('CURL_OPTS')) {
+            define('CURL_OPTS', array(
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_SSL_VERIFYHOST => false
+            ));
         }
-
-        error_log('WP to X Auto Post: 投稿成功 - Tweet ID: ' . $result['id_str']);
-        return true;
+        $result = $twitter->buildOauth($url, 'POST')
+                         ->setPostfields($postfields)
+                         ->performRequest();
+        
+        $response = json_decode($result, true);
+        
+        // レート制限エラーの場合は、ユーザーに通知して再投稿処理を停止
+        if (isset($response['status']) && $response['status'] === 429) {
+            error_log('WP to X Auto Post: レート制限に達しました。再投稿処理を停止します。');
+            return "RATE_LIMIT";
+        }
+        
+        // レスポンスチェック
+        if (isset($response['data']['id'])) {
+            return true;
+        }
+        
+        error_log('WP to X Auto Post: 投稿失敗 - レスポンス: ' . print_r($response, true));
+        return false;
 
     } catch (Exception $e) {
-        error_log('WP to X Auto Post: 例外発生');
-        error_log('WP to X Auto Post: 例外メッセージ - ' . $e->getMessage());
-        error_log('WP to X Auto Post: スタックトレース - ' . $e->getTraceAsString());
+        error_log('WP to X Auto Post: Exception - ' . $e->getMessage());
         return false;
     }
 }
@@ -239,16 +235,25 @@ function wp_to_x_settings_page() {
         $access_token = get_option('wp_to_x_access_token');
         $access_token_secret = get_option('wp_to_x_access_token_secret');
 
-        $test_text = 'これはWP to X Auto Postのテスト投稿です。 ' . date('Y-m-d H:i:s');
+        // WordPressのタイムゾーンを使用して現在時刻を取得
+        $current_time = current_time('Y-m-d H:i:s');
+        $test_text = 'これはWP to X Auto Postのテスト投稿です。 ' . $current_time;
         
         $result = post_to_x_api($test_text, $api_key, $api_secret, $access_token, $access_token_secret);
         
-        if ($result) {
+        if ($result === true) {
             add_settings_error(
                 'wp_to_x_messages',
                 'wp_to_x_test_success',
                 'テスト投稿に成功しました。Xで投稿を確認してください。',
                 'updated'
+            );
+        } elseif ($result === "RATE_LIMIT") {
+            add_settings_error(
+                'wp_to_x_messages',
+                'wp_to_x_test_error',
+                'レート制限に達しました。無料プランの上限は1ヶ月あたり1,500ツイート(17 requests / 24 hours)です。詳細は https://developer.x.com/en/portal/products をご確認ください。',
+                'error'
             );
         } else {
             add_settings_error(
@@ -272,6 +277,9 @@ function wp_to_x_settings_page() {
         update_option('wp_to_x_enable_update_post', isset($_POST['wp_to_x_enable_update_post']) ? '1' : '0');
         update_option('wp_to_x_update_interval', sanitize_text_field($_POST['wp_to_x_update_interval']));
         update_option('wp_to_x_update_template', sanitize_text_field($_POST['wp_to_x_update_template']));
+        update_option('wp_to_x_default_hashtags', sanitize_text_field($_POST['wp_to_x_default_hashtags']));
+        update_option('wp_to_x_use_category_hashtags', isset($_POST['wp_to_x_use_category_hashtags']) ? '1' : '0');
+        update_option('wp_to_x_max_hashtags', sanitize_text_field($_POST['wp_to_x_max_hashtags']));
         
         add_settings_error(
             'wp_to_x_messages',
@@ -289,6 +297,9 @@ function wp_to_x_settings_page() {
     $enable_update_post = get_option('wp_to_x_enable_update_post');
     $update_interval = get_option('wp_to_x_update_interval');
     $update_template = get_option('wp_to_x_update_template');
+    $default_hashtags = get_option('wp_to_x_default_hashtags');
+    $use_category_hashtags = get_option('wp_to_x_use_category_hashtags');
+    $max_hashtags = get_option('wp_to_x_max_hashtags');
     
     // HTMLの出力
     ?>
@@ -484,6 +495,38 @@ function wp_to_x_settings_page() {
                 </tr>
             </table>
             
+            <h3>ハッシュタグ設定</h3>
+            <table class="form-table">
+                <tr>
+                    <th><label for="wp_to_x_default_hashtags">デフォルトハッシュタグ</label></th>
+                    <td>
+                        <input type="text" id="wp_to_x_default_hashtags" name="wp_to_x_default_hashtags" 
+                               value="<?php echo esc_attr($default_hashtags); ?>" class="regular-text">
+                        <p class="description">カンマ区切りで入力してください（例：WordPress,blog）</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th>カテゴリーハッシュタグ</th>
+                    <td>
+                        <label>
+                            <input type="checkbox" name="wp_to_x_use_category_hashtags" 
+                                   value="1" <?php checked($use_category_hashtags, '1'); ?>>
+                            カテゴリーをハッシュタグとして使用する
+                        </label>
+                    </td>
+                </tr>
+                <tr>
+                    <th><label for="wp_to_x_max_hashtags">最大ハッシュタグ数</label></th>
+                    <td>
+                        <select id="wp_to_x_max_hashtags" name="wp_to_x_max_hashtags">
+                            <?php for ($i = 1; $i <= 5; $i++) : ?>
+                                <option value="<?php echo $i; ?>" <?php selected($max_hashtags, $i); ?>><?php echo $i; ?></option>
+                            <?php endfor; ?>
+                        </select>
+                    </td>
+                </tr>
+            </table>
+            
             <h3>API接続テスト</h3>
             <table class="form-table">
                 <tr>
@@ -521,4 +564,169 @@ function wp_to_x_register_settings() {
     register_setting('wp_to_x_settings', 'wp_to_x_enable_update_post');
     register_setting('wp_to_x_settings', 'wp_to_x_update_interval');
     register_setting('wp_to_x_settings', 'wp_to_x_update_template');
-} 
+    
+    // ハッシュタグ関連の設定を登録
+    register_setting('wp_to_x_settings', 'wp_to_x_default_hashtags');
+    register_setting('wp_to_x_settings', 'wp_to_x_use_category_hashtags');
+    register_setting('wp_to_x_settings', 'wp_to_x_max_hashtags');
+}
+
+// メタボックスの表示制御を追加
+add_filter('default_hidden_meta_boxes', 'wp_to_x_show_meta_box', 10, 2);
+function wp_to_x_show_meta_box($hidden, $screen) {
+    if ($screen->base === 'post' && $screen->post_type === 'post') {
+        // wp_to_x_hashtagsをhiddenリストから削除
+        $hidden = array_diff($hidden, array('wp_to_x_hashtags'));
+    }
+    return $hidden;
+}
+
+// プラグインの初期化時にフックを登録
+add_action('init', 'wp_to_x_init');
+
+function wp_to_x_init() {
+    // メタボックスを追加
+    add_action('add_meta_boxes', 'wp_to_x_add_meta_boxes');
+    // 投稿保存時の処理を追加
+    add_action('save_post', 'wp_to_x_save_meta_box_data');
+}
+
+// メタボックスの追加
+function wp_to_x_add_meta_boxes() {
+    add_meta_box(
+        'wp_to_x_hashtags',           // メタボックスのID
+        'X投稿用ハッシュタグ',         // タイトル
+        'wp_to_x_hashtags_meta_box',  // コールバック関数
+        'post',                       // 投稿タイプ
+        'side',                       // 表示位置
+        'high'                        // 優先順位
+    );
+}
+
+// メタボックスの表示内容
+function wp_to_x_hashtags_meta_box($post) {
+    // nonce フィールドを追加
+    wp_nonce_field('wp_to_x_hashtags_nonce', 'wp_to_x_hashtags_nonce');
+
+    // 既存の値を取得
+    $custom_hashtags = get_post_meta($post->ID, 'wp_to_x_custom_hashtags', true);
+    ?>
+    <p>
+        <label for="wp_to_x_custom_hashtags">カスタムハッシュタグ:</label><br>
+        <input type="text" id="wp_to_x_custom_hashtags" name="wp_to_x_custom_hashtags" 
+               value="<?php echo esc_attr($custom_hashtags); ?>" class="widefat">
+    </p>
+    <p class="description">
+        カンマ区切りで入力してください（例：tag1,tag2,tag3）<br>
+        # は自動的に付加されます
+    </p>
+    <?php
+}
+
+// メタボックスのデータを保存
+function wp_to_x_save_meta_box_data($post_id) {
+    // 既存のチェック処理...
+
+    // 処理中フラグをチェック
+    if (get_transient('wp_to_x_processing_post_' . $post_id)) {
+        error_log('WP to X Auto Post: メタボックス保存をスキップ - Post ID: ' . $post_id);
+        return;
+    }
+
+    // カスタムハッシュタグの保存
+    if (isset($_POST['wp_to_x_custom_hashtags'])) {
+        $hashtags = sanitize_text_field($_POST['wp_to_x_custom_hashtags']);
+        update_post_meta($post_id, 'wp_to_x_custom_hashtags', $hashtags);
+        error_log('WP to X Auto Post: カスタムハッシュタグを保存しました - Post ID: ' . $post_id . ', Tags: ' . $hashtags);
+    }
+}
+
+// ハッシュタグを生成する関数を修正
+function wp_to_x_generate_hashtags($post_id) {
+    error_log('WP to X Auto Post: ハッシュタグ生成開始 - Post ID: ' . $post_id);
+    
+    $hashtags = array();
+    $max_hashtags = intval(get_option('wp_to_x_max_hashtags', 3));
+    
+    // カスタムハッシュタグを最初に追加
+    $custom_hashtags = get_post_meta($post_id, 'wp_to_x_custom_hashtags', true);
+    error_log('WP to X Auto Post: 取得したカスタムハッシュタグ - ' . $custom_hashtags);
+    if (!empty($custom_hashtags)) {
+        // カンマとスペースで分割
+        $customs = array_map('trim', preg_split('/[,\s]+/', $custom_hashtags));
+        foreach ($customs as $tag) {
+            if (!empty($tag)) {
+                // 特殊文字を除去し、先頭の#があれば削除
+                $tag = trim($tag, '#');
+                $tag = preg_replace('/[^\p{L}\p{N}_]/u', '', $tag);
+                if (!empty($tag)) {
+                    $hashtags[] = $tag;
+                    error_log('WP to X Auto Post: カスタムハッシュタグ追加 - ' . $tag);
+                }
+            }
+        }
+    }
+    
+    // デフォルトハッシュタグを追加
+    $default_hashtags = get_option('wp_to_x_default_hashtags', '');
+    if (!empty($default_hashtags)) {
+        $defaults = array_map('trim', explode(',', $default_hashtags));
+        foreach ($defaults as $tag) {
+            if (!empty($tag)) {
+                $hashtags[] = $tag;
+                error_log('WP to X Auto Post: デフォルトハッシュタグ追加 - ' . $tag);
+            }
+        }
+    }
+    
+    // カテゴリーをハッシュタグとして使用
+    if (get_option('wp_to_x_use_category_hashtags', '1') === '1') {
+        $categories = get_the_category($post_id);
+        foreach ($categories as $category) {
+            $category_name = preg_replace('/[^\p{L}\p{N}_]/u', '', $category->name);
+            if (!empty($category_name)) {
+                $hashtags[] = $category_name;
+                error_log('WP to X Auto Post: カテゴリーハッシュタグ追加 - ' . $category_name);
+            }
+        }
+    }
+    
+    // 重複を削除し、空の要素を除去
+    $hashtags = array_unique(array_filter($hashtags));
+    
+    // 最大数に制限
+    $hashtags = array_slice($hashtags, 0, $max_hashtags);
+    
+    // ハッシュタグ形式に変換
+    $formatted_hashtags = array_map(function($tag) {
+        $tag = trim($tag, '#');
+        return '#' . $tag;
+    }, $hashtags);
+    
+    $result = implode(' ', $formatted_hashtags);
+    error_log('WP to X Auto Post: 最終ハッシュタグ - ' . $result);
+    
+    return $result;
+}
+ 
+// 管理画面でレート制限の通知を表示する
+function wp_to_x_admin_notice() {
+    $notice = get_option('wp_to_x_rate_limit_notice', '');
+    if (!empty($notice)) {
+         echo '<div class="notice notice-error is-dismissible"><p>' . esc_html($notice) . '</p></div>';
+         // 削除せず、通知を継続表示
+         // delete_option('wp_to_x_rate_limit_notice');
+    }
+}
+add_action('admin_notices', 'wp_to_x_admin_notice');
+add_action('network_admin_notices', 'wp_to_x_admin_notice');
+ 
+// 投稿編集画面にレート制限エラーを表示する
+function wp_to_x_post_edit_notice() {
+    $notice = get_option('wp_to_x_rate_limit_notice', '');
+    if (!empty($notice)) {
+         echo '<div class="notice notice-error is-dismissible"><p>' . esc_html($notice) . '</p></div>';
+         delete_option('wp_to_x_rate_limit_notice');
+    }
+}
+add_action('edit_form_after_title', 'wp_to_x_post_edit_notice');

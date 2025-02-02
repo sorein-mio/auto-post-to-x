@@ -177,9 +177,9 @@ class TwitterAPIExchange
             throw new Exception('Request method must be either POST, GET or PUT or DELETE');
         }
 
-        $consumer_key              = $this->consumer_key;
-        $consumer_secret          = $this->consumer_secret;
-        $oauth_access_token       = $this->oauth_access_token;
+        $consumer_key = $this->consumer_key;
+        $consumer_secret = $this->consumer_secret;
+        $oauth_access_token = $this->oauth_access_token;
         $oauth_access_token_secret = $this->oauth_access_token_secret;
 
         $oauth = array(
@@ -191,42 +191,40 @@ class TwitterAPIExchange
             'oauth_version' => '1.0'
         );
 
-        $getfield = $this->getGetfield();
-
-        if (!is_null($getfield))
-        {
-            $getfields = str_replace('?', '', explode('&', $getfield));
-
-            foreach ($getfields as $g)
-            {
-                $split = explode('=', $g);
-
-                /** In case a null is passed through **/
-                if (isset($split[1]))
-                {
-                    $oauth[$split[0]] = urldecode($split[1]);
-                }
-            }
-        }
-
-        $postfields = $this->getPostfields();
-
-        if (!is_null($postfields)) {
-            foreach ($postfields as $key => $value) {
-                $oauth[$key] = $value;
-            }
-        }
-
         $base_info = $this->buildBaseString($url, $requestMethod, $oauth);
         $composite_key = rawurlencode($consumer_secret) . '&' . rawurlencode($oauth_access_token_secret);
         $oauth_signature = base64_encode(hash_hmac('sha1', $base_info, $composite_key, true));
         $oauth['oauth_signature'] = $oauth_signature;
 
-        $this->url           = $url;
+        $this->url = $url;
         $this->requestMethod = $requestMethod;
-        $this->oauth         = $oauth;
+        $this->oauth = $oauth;
 
         return $this;
+    }
+
+    /**
+     * Private method to generate the base string used by cURL
+     *
+     * @param string $baseURI
+     * @param string $method
+     * @param array  $params
+     *
+     * @return string Built base string
+     */
+    private function buildBaseString($baseURI, $method, $params)
+    {
+        $r = array();
+        ksort($params);
+        foreach($params as $key => $value)
+        {
+            // API v2では、POSTパラメータはOAuth署名に含めない
+            if (in_array($key, array('oauth_consumer_key', 'oauth_nonce', 'oauth_signature_method',
+                'oauth_timestamp', 'oauth_token', 'oauth_version'))) {
+                $r[] = rawurlencode($key) . '=' . rawurlencode($value);
+            }
+        }
+        return $method . '&' . rawurlencode($baseURI) . '&' . rawurlencode(implode('&', $r));
     }
 
     /**
@@ -243,30 +241,40 @@ class TwitterAPIExchange
             throw new Exception('performRequest parameter must be true or false');
         }
 
-        $header =  array($this->buildAuthorizationHeader($this->oauth), 'Expect:');
+        $header = array(
+            $this->buildAuthorizationHeader($this->oauth),
+            'Content-Type: application/json',
+            'Expect:'
+        );
 
         $getfield = $this->getGetfield();
         $postfields = $this->getPostfields();
 
+        $options = array(
+            CURLOPT_HTTPHEADER => $header,
+            CURLOPT_HEADER => false,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 10,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false,
+            CURLOPT_VERBOSE => false
+        );
+
         if (!is_null($getfield))
         {
-            $options = array(
-                CURLOPT_URL => $this->url . $getfield,
-                CURLOPT_HTTPHEADER => $header,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 10,
-            );
+            $options[CURLOPT_URL] = $this->url . $getfield;
         }
         else
         {
-            $options = array(
-                CURLOPT_URL => $this->url,
-                CURLOPT_HTTPHEADER => $header,
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_TIMEOUT => 10,
-                CURLOPT_POSTFIELDS => json_encode($postfields),
-                CURLOPT_CUSTOMREQUEST => $this->requestMethod,
-            );
+            $options[CURLOPT_URL] = $this->url;
+            if (!is_null($postfields)) {
+                $json_data = json_encode($postfields);
+                $options[CURLOPT_POSTFIELDS] = $json_data;
+                $options[CURLOPT_CUSTOMREQUEST] = $this->requestMethod;
+                error_log("WP to X Auto Post - Request URL: " . $this->url);
+                error_log("WP to X Auto Post - Request Method: " . $this->requestMethod);
+                error_log("WP to X Auto Post - Request Body: " . $json_data);
+            }
         }
 
         $feed = curl_init();
@@ -274,39 +282,17 @@ class TwitterAPIExchange
         $json = curl_exec($feed);
 
         $this->httpcode = curl_getinfo($feed, CURLINFO_HTTP_CODE);
+        error_log("WP to X Auto Post - HTTP Status Code: " . $this->httpcode);
 
         if (($error = curl_error($feed)) !== '')
         {
             curl_close($feed);
-
             throw new \Exception($error);
         }
 
         curl_close($feed);
 
         return $json;
-    }
-
-    /**
-     * Private method to generate the base string used by cURL
-     *
-     * @param string $baseURI
-     * @param string $method
-     * @param array  $params
-     *
-     * @return string Built base string
-     */
-    private function buildBaseString($baseURI, $method, $params)
-    {
-        $return = array();
-        ksort($params);
-
-        foreach($params as $key => $value)
-        {
-            $return[] = rawurlencode($key) . '=' . rawurlencode($value);
-        }
-
-        return $method . "&" . rawurlencode($baseURI) . '&' . rawurlencode(implode('&', $return));
     }
 
     /**
