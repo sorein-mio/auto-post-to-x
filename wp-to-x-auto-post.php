@@ -1,9 +1,11 @@
 <?php
 /*
-Plugin Name: WP to X Auto Post
+Plugin Name: Auto Post to X
 Description: WordPressの投稿を自動的にXに投稿するプラグイン
-Version: 1.0
+Version: 1.0.0
 Author: sorein
+License: GPLv2 or later
+License URI: http://www.gnu.org/licenses/gpl-2.0.html
 */
 
 if (!defined('ABSPATH')) {
@@ -75,15 +77,30 @@ function handle_post_status_transition($new_status, $old_status, $post) {
                 return;
             }
 
+            // カスタムハッシュタグの保存処理を先に行う
+            if (isset($_POST['wp_to_x_custom_hashtags'])) {
+                $hashtags = sanitize_text_field($_POST['wp_to_x_custom_hashtags']);
+                update_post_meta($post->ID, 'wp_to_x_custom_hashtags', $hashtags);
+                error_log('WP to X Auto Post: カスタムハッシュタグを事前保存 - Post ID: ' . $post->ID . ', Tags: ' . $hashtags);
+                
+                // 保存後に少し待機して確実にデータベースに反映させる
+                usleep(500000); // 0.5秒待機
+            }
+
             // 投稿内容を作成
             $post_title = $post->post_title;
             $post_url = get_permalink($post->ID);
+            
+            // ハッシュタグを生成（保存されたデータを使用）
             $hashtags = wp_to_x_generate_hashtags($post->ID);
+            error_log('WP to X Auto Post: 生成されたハッシュタグ: ' . print_r($hashtags, true));
             
             $tweet_text = $post_title . ' ' . $post_url;
             if (!empty($hashtags)) {
                 $tweet_text .= ' ' . $hashtags;
             }
+
+            error_log('WP to X Auto Post: 最終的な投稿内容: ' . $tweet_text);
 
             // Xに投稿
             $result = post_to_x_api($tweet_text, $api_key, $api_secret, $access_token, $access_token_secret);
@@ -213,8 +230,8 @@ add_action('admin_menu', 'wp_to_x_add_menu');
 
 function wp_to_x_add_menu() {
     add_options_page(
-        'WP to X設定',
-        'WP to X設定',
+        'Auto Post to X設定',
+        'Auto Post to X設定',
         'manage_options',
         'wp-to-x-settings',
         'wp_to_x_settings_page'
@@ -237,7 +254,7 @@ function wp_to_x_settings_page() {
 
         // WordPressのタイムゾーンを使用して現在時刻を取得
         $current_time = current_time('Y-m-d H:i:s');
-        $test_text = 'これはWP to X Auto Postのテスト投稿です。 ' . $current_time;
+        $test_text = 'これはAuto Post to Xのテスト投稿です。 ' . $current_time;
         
         $result = post_to_x_api($test_text, $api_key, $api_secret, $access_token, $access_token_secret);
         
@@ -304,7 +321,7 @@ function wp_to_x_settings_page() {
     // HTMLの出力
     ?>
     <div class="wrap">
-        <h2>WP to X 設定</h2>
+        <h2>Auto Post to X設定</h2>
         
         <?php settings_errors('wp_to_x_messages'); ?>
         
@@ -651,9 +668,10 @@ function wp_to_x_generate_hashtags($post_id) {
     // カスタムハッシュタグを最初に追加
     $custom_hashtags = get_post_meta($post_id, 'wp_to_x_custom_hashtags', true);
     error_log('WP to X Auto Post: 取得したカスタムハッシュタグ - ' . $custom_hashtags);
+    
     if (!empty($custom_hashtags)) {
-        // カンマとスペースで分割
-        $customs = array_map('trim', preg_split('/[,\s]+/', $custom_hashtags));
+        // カンマで分割（スペースは無視）
+        $customs = array_map('trim', explode(',', $custom_hashtags));
         foreach ($customs as $tag) {
             if (!empty($tag)) {
                 // 特殊文字を除去し、先頭の#があれば削除
@@ -667,22 +685,25 @@ function wp_to_x_generate_hashtags($post_id) {
         }
     }
     
-    // デフォルトハッシュタグを追加
-    $default_hashtags = get_option('wp_to_x_default_hashtags', '');
-    if (!empty($default_hashtags)) {
-        $defaults = array_map('trim', explode(',', $default_hashtags));
-        foreach ($defaults as $tag) {
-            if (!empty($tag)) {
-                $hashtags[] = $tag;
-                error_log('WP to X Auto Post: デフォルトハッシュタグ追加 - ' . $tag);
+    // デフォルトハッシュタグを追加（最大数に達していない場合のみ）
+    if (count($hashtags) < $max_hashtags) {
+        $default_hashtags = get_option('wp_to_x_default_hashtags', '');
+        if (!empty($default_hashtags)) {
+            $defaults = array_map('trim', explode(',', $default_hashtags));
+            foreach ($defaults as $tag) {
+                if (!empty($tag) && count($hashtags) < $max_hashtags) {
+                    $hashtags[] = trim($tag, '#');
+                    error_log('WP to X Auto Post: デフォルトハッシュタグ追加 - ' . $tag);
+                }
             }
         }
     }
     
-    // カテゴリーをハッシュタグとして使用
-    if (get_option('wp_to_x_use_category_hashtags', '1') === '1') {
+    // カテゴリーをハッシュタグとして使用（最大数に達していない場合のみ）
+    if (count($hashtags) < $max_hashtags && get_option('wp_to_x_use_category_hashtags', '1') === '1') {
         $categories = get_the_category($post_id);
         foreach ($categories as $category) {
+            if (count($hashtags) >= $max_hashtags) break;
             $category_name = preg_replace('/[^\p{L}\p{N}_]/u', '', $category->name);
             if (!empty($category_name)) {
                 $hashtags[] = $category_name;
@@ -699,12 +720,11 @@ function wp_to_x_generate_hashtags($post_id) {
     
     // ハッシュタグ形式に変換
     $formatted_hashtags = array_map(function($tag) {
-        $tag = trim($tag, '#');
         return '#' . $tag;
     }, $hashtags);
     
     $result = implode(' ', $formatted_hashtags);
-    error_log('WP to X Auto Post: 最終ハッシュタグ - ' . $result);
+    error_log('Auto Post to X: 最終ハッシュタグ - ' . $result);
     
     return $result;
 }
