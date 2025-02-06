@@ -5,9 +5,6 @@ WordPressの記事を自動的にX（旧Twitter）に投稿するためのWordPr
 
 **現在のバージョン**: 1.0.0
 
-## スクリーンショット
-![設定画面](assets/images/settings.png)
-
 ## 主な機能
 - WordPressの新規投稿を自動的にXに投稿
 - 記事更新時の自動投稿（オプション）
