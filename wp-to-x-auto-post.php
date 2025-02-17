@@ -667,19 +667,19 @@ function wp_to_x_generate_hashtags($post_id) {
     
     // カスタムハッシュタグを最初に追加
     $custom_hashtags = get_post_meta($post_id, 'wp_to_x_custom_hashtags', true);
-    error_log('WP to X Auto Post: 取得したカスタムハッシュタグ - ' . $custom_hashtags);
+    error_log('WP to X Auto Post: 取得したカスタムハッシュタグ - ' . print_r($custom_hashtags, true));
     
     if (!empty($custom_hashtags)) {
-        // カンマで分割（スペースは無視）
-        $customs = array_map('trim', explode(',', $custom_hashtags));
+        // カンマまたはスペースで分割
+        $customs = preg_split('/[,\s]+/', $custom_hashtags);
         foreach ($customs as $tag) {
             if (!empty($tag)) {
                 // 特殊文字を除去し、先頭の#があれば削除
                 $tag = trim($tag, '#');
                 $tag = preg_replace('/[^\p{L}\p{N}_]/u', '', $tag);
                 if (!empty($tag)) {
-                    $hashtags[] = $tag;
-                    error_log('WP to X Auto Post: カスタムハッシュタグ追加 - ' . $tag);
+                    $hashtags[] = '#' . $tag;
+                    error_log('WP to X Auto Post: カスタムハッシュタグ追加 - #' . $tag);
                 }
             }
         }
@@ -689,44 +689,38 @@ function wp_to_x_generate_hashtags($post_id) {
     if (count($hashtags) < $max_hashtags) {
         $default_hashtags = get_option('wp_to_x_default_hashtags', '');
         if (!empty($default_hashtags)) {
-            $defaults = array_map('trim', explode(',', $default_hashtags));
+            $defaults = preg_split('/[,\s]+/', $default_hashtags);
             foreach ($defaults as $tag) {
                 if (!empty($tag) && count($hashtags) < $max_hashtags) {
-                    $hashtags[] = trim($tag, '#');
-                    error_log('WP to X Auto Post: デフォルトハッシュタグ追加 - ' . $tag);
+                    $tag = trim($tag, '#');
+                    $tag = preg_replace('/[^\p{L}\p{N}_]/u', '', $tag);
+                    if (!empty($tag)) {
+                        $hashtags[] = '#' . $tag;
+                        error_log('WP to X Auto Post: デフォルトハッシュタグ追加 - #' . $tag);
+                    }
                 }
             }
         }
     }
     
-    // カテゴリーをハッシュタグとして使用（最大数に達していない場合のみ）
-    if (count($hashtags) < $max_hashtags && get_option('wp_to_x_use_category_hashtags', '1') === '1') {
+    // カテゴリーをハッシュタグとして追加（設定が有効で、最大数に達していない場合のみ）
+    if (get_option('wp_to_x_use_category_hashtags', '1') === '1' && count($hashtags) < $max_hashtags) {
         $categories = get_the_category($post_id);
-        foreach ($categories as $category) {
-            if (count($hashtags) >= $max_hashtags) break;
-            $category_name = preg_replace('/[^\p{L}\p{N}_]/u', '', $category->name);
-            if (!empty($category_name)) {
-                $hashtags[] = $category_name;
-                error_log('WP to X Auto Post: カテゴリーハッシュタグ追加 - ' . $category_name);
+        if (!empty($categories)) {
+            foreach ($categories as $category) {
+                if (count($hashtags) < $max_hashtags) {
+                    $tag = preg_replace('/[^\p{L}\p{N}_]/u', '', $category->name);
+                    if (!empty($tag)) {
+                        $hashtags[] = '#' . $tag;
+                        error_log('WP to X Auto Post: カテゴリーハッシュタグ追加 - #' . $tag);
+                    }
+                }
             }
         }
     }
     
-    // 重複を削除し、空の要素を除去
-    $hashtags = array_unique(array_filter($hashtags));
-    
-    // 最大数に制限
-    $hashtags = array_slice($hashtags, 0, $max_hashtags);
-    
-    // ハッシュタグ形式に変換
-    $formatted_hashtags = array_map(function($tag) {
-        return '#' . $tag;
-    }, $hashtags);
-    
-    $result = implode(' ', $formatted_hashtags);
-    error_log('Auto Post to X: 最終ハッシュタグ - ' . $result);
-    
-    return $result;
+    error_log('WP to X Auto Post: 最終的なハッシュタグ - ' . print_r($hashtags, true));
+    return implode(' ', array_unique($hashtags));
 }
  
 // 管理画面でレート制限の通知を表示する

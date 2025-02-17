@@ -1,0 +1,34 @@
+# WordPress
+wp-config.php
+wp-content/
+!wp-content/plugins/
+wp-content/plugins/*
+!wp-content/plugins/auto-post-to-x/
+
+# デプロイ関連
+deploy.ps1
+*.zip
+
+# 一時ファイル
+*.log
+*.bak
+*.tmp
+~*
+
+# エディタ設定
+.vscode/
+.idea/
+*.sublime-*
+
+# OS生成ファイル
+.DS_Store
+Thumbs.db
+
+# 開発環境
+node_modules/
+vendor/
+*.map
+
+# バックアップ
+backups/
+*.backup 
